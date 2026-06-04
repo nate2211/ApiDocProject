@@ -1,0 +1,48 @@
+[
+  {
+    "name": "--- Select a Preset ---",
+    "blocks": [],
+    "extras": "",
+    "model": "lexicon"
+  },
+  {
+    "name": "APIDoc Direct - Mixed",
+    "blocks": [
+      "apidoc"
+    ],
+    "extras": "apidoc.query_file=queries/mixed_direct_queries.txt\napidoc.profile=all\napidoc.out_path=out/apidocs_direct.md\napidoc.direct_mode=true\napidoc.search_fallback=false\napidoc.max_pages_per_query=5",
+    "model": "lexicon"
+  },
+  {
+    "name": "APIDoc Direct - Python",
+    "blocks": [
+      "apidoc"
+    ],
+    "extras": "apidoc.query_file=queries/python_direct_queries.txt\napidoc.profile=python\napidoc.out_path=out/python_direct_apidocs.md\napidoc.search_fallback=false",
+    "model": "lexicon"
+  },
+  {
+    "name": "APIDoc Direct - CSharp DotNet",
+    "blocks": [
+      "apidoc"
+    ],
+    "extras": "apidoc.query_file=queries/csharp_direct_queries.txt\napidoc.profile=csharp\napidoc.out_path=out/csharp_direct_apidocs.md\napidoc.search_fallback=false",
+    "model": "lexicon"
+  },
+  {
+    "name": "APIDoc Direct - Monero Mining",
+    "blocks": [
+      "apidoc"
+    ],
+    "extras": "apidoc.query_file=queries/monero_direct_queries.txt\napidoc.profile=monero\napidoc.out_path=out/monero_direct_apidocs.md\napidoc.search_fallback=false\napidoc.max_pages_per_query=6",
+    "model": "lexicon"
+  },
+  {
+    "name": "APIDoc Direct Debug Pipeline",
+    "blocks": [
+      "pipeline"
+    ],
+    "extras": "pipeline.stages=apidoc_parse|apidoc_discover|apidoc_fetch|apidoc_markdown\npipeline.debug=true\npipeline.apidoc_parse.query_file=queries/mixed_direct_queries.txt\npipeline.apidoc_discover.profile=all\npipeline.apidoc_discover.search_fallback=false\npipeline.apidoc_fetch.max_pages_per_query=5\npipeline.apidoc_markdown.out_path=out/apidocs_direct_pipeline.md",
+    "model": "lexicon"
+  }
+]
