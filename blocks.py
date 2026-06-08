@@ -6409,3 +6409,2237 @@ BLOCKS.register("apidoc_code_fetch", APIDocSourceFetchBlock)
 
 BLOCKS.register("apidoc_source_help", APIDocSourceExplainBlock)
 BLOCKS.register("apidoc_decipher_help", APIDocSourceExplainBlock)
+
+# ---------------------------------------------------------------------------
+# Symbol-detail APIDoc blocks
+# ---------------------------------------------------------------------------
+# This patch adds source-symbol extraction so APIDoc can return specific
+# information about classes, nested classes, functions, methods, properties,
+# dataclass fields, annotated attributes, assignments, decorators, signatures,
+# docstrings, imports, generated doc queries, and formatted Markdown output.
+#
+# It is intentionally stdlib-only and append-safe: it does not change the
+# existing APIDoc fetch engine, but gives the APIDoc pipeline a richer source
+# analysis return shape.
+# ---------------------------------------------------------------------------
+
+import ast as _apidoc_ast
+from dataclasses import dataclass as _apidoc_dataclass, field as _apidoc_field
+from typing import Any as _APIDocAny, Dict as _APIDocDict, List as _APIDocList, Optional as _APIDocOptional, Tuple as _APIDocTuple
+
+
+@_apidoc_dataclass
+class APIDocSymbolField:
+    name: str
+    kind: str
+    annotation: str = ""
+    value: str = ""
+    line: int = 0
+    decorators: _APIDocList[str] = _apidoc_field(default_factory=list)
+
+
+@_apidoc_dataclass
+class APIDocCallableSymbol:
+    name: str
+    qualname: str
+    kind: str
+    signature: str = ""
+    returns: str = ""
+    docstring: str = ""
+    line: int = 0
+    end_line: int = 0
+    decorators: _APIDocList[str] = _apidoc_field(default_factory=list)
+    args: _APIDocList[str] = _apidoc_field(default_factory=list)
+    api_queries: _APIDocList[str] = _apidoc_field(default_factory=list)
+
+
+@_apidoc_dataclass
+class APIDocClassSymbol:
+    name: str
+    qualname: str
+    bases: _APIDocList[str] = _apidoc_field(default_factory=list)
+    decorators: _APIDocList[str] = _apidoc_field(default_factory=list)
+    docstring: str = ""
+    line: int = 0
+    end_line: int = 0
+    fields: _APIDocList[APIDocSymbolField] = _apidoc_field(default_factory=list)
+    properties: _APIDocList[APIDocCallableSymbol] = _apidoc_field(default_factory=list)
+    methods: _APIDocList[APIDocCallableSymbol] = _apidoc_field(default_factory=list)
+    class_functions: _APIDocList[APIDocCallableSymbol] = _apidoc_field(default_factory=list)
+    static_functions: _APIDocList[APIDocCallableSymbol] = _apidoc_field(default_factory=list)
+    nested_classes: _APIDocList["APIDocClassSymbol"] = _apidoc_field(default_factory=list)
+    api_queries: _APIDocList[str] = _apidoc_field(default_factory=list)
+
+
+def _apidoc_unparse(node: _APIDocAny) -> str:
+    if node is None:
+        return ""
+    try:
+        return _apidoc_ast.unparse(node)
+    except Exception:
+        return ""
+
+
+def _apidoc_decorator_name(node: _APIDocAny) -> str:
+    text = _apidoc_unparse(node)
+    if text:
+        return text
+    if isinstance(node, _apidoc_ast.Name):
+        return node.id
+    if isinstance(node, _apidoc_ast.Attribute):
+        return node.attr
+    return node.__class__.__name__
+
+
+def _apidoc_arg_name(arg: _APIDocAny) -> str:
+    if not isinstance(arg, _apidoc_ast.arg):
+        return ""
+    if arg.annotation is not None:
+        return f"{arg.arg}: {_apidoc_unparse(arg.annotation)}"
+    return arg.arg
+
+
+def _apidoc_signature(fn: _APIDocAny) -> _APIDocTuple[str, _APIDocList[str], str]:
+    if not isinstance(fn, (_apidoc_ast.FunctionDef, _apidoc_ast.AsyncFunctionDef)):
+        return "()", [], ""
+
+    args_obj = fn.args
+    args: _APIDocList[str] = []
+
+    posonly = [_apidoc_arg_name(a) for a in getattr(args_obj, "posonlyargs", [])]
+    normal = [_apidoc_arg_name(a) for a in getattr(args_obj, "args", [])]
+    vararg = [_apidoc_arg_name(args_obj.vararg)] if getattr(args_obj, "vararg", None) else []
+    kwonly = [_apidoc_arg_name(a) for a in getattr(args_obj, "kwonlyargs", [])]
+    kwarg = [_apidoc_arg_name(args_obj.kwarg)] if getattr(args_obj, "kwarg", None) else []
+
+    args.extend([a for a in posonly if a])
+    if posonly:
+        args.append("/")
+    args.extend([a for a in normal if a])
+    args.extend([f"*{a}" for a in vararg if a])
+    if kwonly and not vararg:
+        args.append("*")
+    args.extend([a for a in kwonly if a])
+    args.extend([f"**{a}" for a in kwarg if a])
+
+    returns = _apidoc_unparse(fn.returns)
+    signature = f"({', '.join(args)})"
+    if returns:
+        signature += f" -> {returns}"
+    return signature, args, returns
+
+
+def _apidoc_callable_from_node(
+    fn: _APIDocAny,
+    *,
+    qualprefix: str = "",
+    kind: str = "function",
+    module_name: str = "",
+) -> APIDocCallableSymbol:
+    decorators = [_apidoc_decorator_name(d) for d in getattr(fn, "decorator_list", [])]
+    signature, args, returns = _apidoc_signature(fn)
+    name = getattr(fn, "name", "")
+    qualname = f"{qualprefix}.{name}" if qualprefix else name
+    full_query = f"{module_name}.{qualname}" if module_name else qualname
+    api_queries = [full_query]
+    if module_name and "." in qualname:
+        api_queries.append(qualname)
+
+    return APIDocCallableSymbol(
+        name=name,
+        qualname=qualname,
+        kind=kind,
+        signature=signature,
+        returns=returns,
+        docstring=_apidoc_ast.get_docstring(fn) or "",
+        line=int(getattr(fn, "lineno", 0) or 0),
+        end_line=int(getattr(fn, "end_lineno", 0) or 0),
+        decorators=decorators,
+        args=args,
+        api_queries=_apidoc_dedupe_symbol_lines(api_queries),
+    )
+
+
+def _apidoc_is_property(fn: _APIDocAny) -> bool:
+    decorators = [_apidoc_decorator_name(d).lower() for d in getattr(fn, "decorator_list", [])]
+    if "property" in decorators:
+        return True
+    if any(d.endswith(".setter") or d.endswith(".deleter") for d in decorators):
+        return True
+    if "cached_property" in decorators or "functools.cached_property" in decorators:
+        return True
+    return False
+
+
+def _apidoc_method_kind(fn: _APIDocAny) -> str:
+    decorators = [_apidoc_decorator_name(d).lower() for d in getattr(fn, "decorator_list", [])]
+    if _apidoc_is_property(fn):
+        return "property"
+    if "classmethod" in decorators:
+        return "class_method"
+    if "staticmethod" in decorators:
+        return "static_method"
+    return "method"
+
+
+def _apidoc_targets_to_names(target: _APIDocAny) -> _APIDocList[str]:
+    if isinstance(target, _apidoc_ast.Name):
+        return [target.id]
+    if isinstance(target, _apidoc_ast.Attribute):
+        return [_apidoc_unparse(target)]
+    if isinstance(target, (_apidoc_ast.Tuple, _apidoc_ast.List)):
+        out: _APIDocList[str] = []
+        for elt in target.elts:
+            out.extend(_apidoc_targets_to_names(elt))
+        return out
+    return []
+
+
+def _apidoc_field_from_annassign(node: _APIDocAny) -> _APIDocList[APIDocSymbolField]:
+    names = _apidoc_targets_to_names(getattr(node, "target", None))
+    return [
+        APIDocSymbolField(
+            name=name,
+            kind="annotated_attribute",
+            annotation=_apidoc_unparse(getattr(node, "annotation", None)),
+            value=_apidoc_unparse(getattr(node, "value", None)),
+            line=int(getattr(node, "lineno", 0) or 0),
+        )
+        for name in names
+    ]
+
+
+def _apidoc_field_from_assign(node: _APIDocAny) -> _APIDocList[APIDocSymbolField]:
+    out: _APIDocList[APIDocSymbolField] = []
+    for target in getattr(node, "targets", []) or []:
+        for name in _apidoc_targets_to_names(target):
+            out.append(
+                APIDocSymbolField(
+                    name=name,
+                    kind="assignment",
+                    value=_apidoc_unparse(getattr(node, "value", None)),
+                    line=int(getattr(node, "lineno", 0) or 0),
+                )
+            )
+    return out
+
+
+def _apidoc_dedupe_symbol_lines(items: _APIDocList[str]) -> _APIDocList[str]:
+    seen = set()
+    out: _APIDocList[str] = []
+    for item in items:
+        item = str(item).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _apidoc_class_from_node(
+    cls: _APIDocAny,
+    *,
+    qualprefix: str = "",
+    module_name: str = "",
+) -> APIDocClassSymbol:
+    name = getattr(cls, "name", "")
+    qualname = f"{qualprefix}.{name}" if qualprefix else name
+    full_query = f"{module_name}.{qualname}" if module_name else qualname
+
+    symbol = APIDocClassSymbol(
+        name=name,
+        qualname=qualname,
+        bases=[_apidoc_unparse(b) for b in getattr(cls, "bases", [])],
+        decorators=[_apidoc_decorator_name(d) for d in getattr(cls, "decorator_list", [])],
+        docstring=_apidoc_ast.get_docstring(cls) or "",
+        line=int(getattr(cls, "lineno", 0) or 0),
+        end_line=int(getattr(cls, "end_lineno", 0) or 0),
+        api_queries=[full_query, qualname] if module_name else [qualname],
+    )
+    symbol.api_queries = _apidoc_dedupe_symbol_lines(symbol.api_queries)
+
+    for child in getattr(cls, "body", []) or []:
+        if isinstance(child, _apidoc_ast.AnnAssign):
+            symbol.fields.extend(_apidoc_field_from_annassign(child))
+        elif isinstance(child, _apidoc_ast.Assign):
+            symbol.fields.extend(_apidoc_field_from_assign(child))
+        elif isinstance(child, (_apidoc_ast.FunctionDef, _apidoc_ast.AsyncFunctionDef)):
+            method_kind = _apidoc_method_kind(child)
+            callable_symbol = _apidoc_callable_from_node(
+                child,
+                qualprefix=qualname,
+                kind=method_kind,
+                module_name=module_name,
+            )
+            if method_kind == "property":
+                symbol.properties.append(callable_symbol)
+            elif method_kind == "class_method":
+                symbol.class_functions.append(callable_symbol)
+            elif method_kind == "static_method":
+                symbol.static_functions.append(callable_symbol)
+            else:
+                symbol.methods.append(callable_symbol)
+        elif isinstance(child, _apidoc_ast.ClassDef):
+            symbol.nested_classes.append(
+                _apidoc_class_from_node(child, qualprefix=qualname, module_name=module_name)
+            )
+
+    return symbol
+
+
+def _apidoc_symbol_to_plain_dict(value: _APIDocAny) -> _APIDocAny:
+    if isinstance(value, (APIDocSymbolField, APIDocCallableSymbol, APIDocClassSymbol)):
+        raw = value.__dict__
+        return {k: _apidoc_symbol_to_plain_dict(v) for k, v in raw.items()}
+    if isinstance(value, list):
+        return [_apidoc_symbol_to_plain_dict(v) for v in value]
+    if isinstance(value, tuple):
+        return [_apidoc_symbol_to_plain_dict(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _apidoc_symbol_to_plain_dict(v) for k, v in value.items()}
+    return value
+
+
+def _apidoc_module_name_from_path(path: str) -> str:
+    try:
+        p = Path(path)
+        if p.suffix:
+            return p.stem
+        return p.name
+    except Exception:
+        return ""
+
+
+def _apidoc_read_symbol_sources(payload: _APIDocAny, params: _APIDocDict[str, _APIDocAny]) -> _APIDocList[_APIDocDict[str, str]]:
+    max_bytes = int(params.get("max_bytes_per_file", 320000) or 320000)
+    sources: _APIDocList[_APIDocDict[str, str]] = []
+
+    def add_code(label: str, code: str) -> None:
+        if not code:
+            return
+        sources.append({"path": label, "code": str(code)[:max_bytes]})
+
+    def add_path(pathish: _APIDocAny) -> None:
+        try:
+            p = Path(str(pathish)).expanduser()
+            if p.is_file():
+                if p.suffix.lower() in {".py", ".pyw", ".txt", ".md"}:
+                    add_code(str(p), p.read_text(encoding="utf-8", errors="replace"))
+            elif p.is_dir():
+                max_files = int(params.get("max_files", 80) or 80)
+                count = 0
+                for child in p.rglob("*.py"):
+                    if count >= max_files:
+                        break
+                    add_code(str(child), child.read_text(encoding="utf-8", errors="replace"))
+                    count += 1
+        except Exception:
+            pass
+
+    if isinstance(payload, dict):
+        for key in ("code", "source", "text"):
+            if isinstance(payload.get(key), str):
+                add_code(f"inline:{key}", payload[key])
+        for key in ("path", "source_path", "code_file"):
+            if payload.get(key):
+                add_path(payload[key])
+        for key in ("paths", "files"):
+            if isinstance(payload.get(key), list):
+                for item in payload[key]:
+                    add_path(item)
+        if not sources:
+            add_code("inline:dict", json.dumps(payload, indent=2, ensure_ascii=False))
+    elif isinstance(payload, list):
+        for i, item in enumerate(payload):
+            if isinstance(item, str) and ("\n" in item or item.strip().startswith(("class ", "def ", "from ", "import "))):
+                add_code(f"inline:{i}", item)
+            else:
+                add_path(item)
+    elif isinstance(payload, str):
+        text = payload
+        p = Path(text).expanduser()
+        if ("\n" in text) or text.strip().startswith(("class ", "def ", "from ", "import ", "@")):
+            add_code("inline", text)
+        elif p.exists():
+            add_path(p)
+        else:
+            add_code("inline", text)
+    else:
+        add_code("inline", str(payload))
+
+    return sources
+
+
+def _apidoc_parse_python_symbol_source(path: str, code: str) -> _APIDocDict[str, _APIDocAny]:
+    module_name = _apidoc_module_name_from_path(path)
+    result: _APIDocDict[str, _APIDocAny] = {
+        "path": path,
+        "module": module_name,
+        "language": "python",
+        "imports": [],
+        "classes": [],
+        "functions": [],
+        "constants": [],
+        "errors": [],
+    }
+
+    try:
+        tree = _apidoc_ast.parse(code)
+    except SyntaxError as exc:
+        result["errors"].append(
+            {
+                "type": "SyntaxError",
+                "message": str(exc),
+                "line": int(getattr(exc, "lineno", 0) or 0),
+                "offset": int(getattr(exc, "offset", 0) or 0),
+            }
+        )
+        return result
+    except Exception as exc:
+        result["errors"].append({"type": exc.__class__.__name__, "message": str(exc)})
+        return result
+
+    for node in getattr(tree, "body", []) or []:
+        if isinstance(node, _apidoc_ast.Import):
+            for alias in node.names:
+                result["imports"].append(
+                    {
+                        "kind": "import",
+                        "name": alias.name,
+                        "asname": alias.asname,
+                        "line": int(getattr(node, "lineno", 0) or 0),
+                    }
+                )
+        elif isinstance(node, _apidoc_ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                full = f"{module}.{alias.name}" if module else alias.name
+                result["imports"].append(
+                    {
+                        "kind": "from_import",
+                        "module": module,
+                        "name": alias.name,
+                        "full_name": full,
+                        "asname": alias.asname,
+                        "line": int(getattr(node, "lineno", 0) or 0),
+                    }
+                )
+        elif isinstance(node, _apidoc_ast.ClassDef):
+            result["classes"].append(
+                _apidoc_symbol_to_plain_dict(_apidoc_class_from_node(node, module_name=module_name))
+            )
+        elif isinstance(node, (_apidoc_ast.FunctionDef, _apidoc_ast.AsyncFunctionDef)):
+            result["functions"].append(
+                _apidoc_symbol_to_plain_dict(
+                    _apidoc_callable_from_node(node, kind="async_function" if isinstance(node, _apidoc_ast.AsyncFunctionDef) else "function", module_name=module_name)
+                )
+            )
+        elif isinstance(node, _apidoc_ast.AnnAssign):
+            result["constants"].extend(_apidoc_symbol_to_plain_dict(_apidoc_field_from_annassign(node)))
+        elif isinstance(node, _apidoc_ast.Assign):
+            result["constants"].extend(_apidoc_symbol_to_plain_dict(_apidoc_field_from_assign(node)))
+
+    return result
+
+
+def _apidoc_collect_queries_from_symbol_analysis(analysis: _APIDocDict[str, _APIDocAny]) -> _APIDocList[str]:
+    queries: _APIDocList[str] = []
+
+    def add(item: str) -> None:
+        item = str(item).strip()
+        if item:
+            queries.append(item)
+
+    for file_info in analysis.get("files", []) or []:
+        for imp in file_info.get("imports", []) or []:
+            if imp.get("full_name"):
+                add(imp["full_name"])
+            elif imp.get("name"):
+                add(imp["name"])
+
+        for const in file_info.get("constants", []) or []:
+            add(const.get("name", ""))
+
+        for fn in file_info.get("functions", []) or []:
+            for q in fn.get("api_queries", []) or []:
+                add(q)
+
+        def walk_class(cls: _APIDocDict[str, _APIDocAny]) -> None:
+            for q in cls.get("api_queries", []) or []:
+                add(q)
+            for field in cls.get("fields", []) or []:
+                add(f"{cls.get('qualname')}.{field.get('name')}")
+            for section in ("properties", "methods", "class_functions", "static_functions"):
+                for fn in cls.get(section, []) or []:
+                    for q in fn.get("api_queries", []) or []:
+                        add(q)
+            for nested in cls.get("nested_classes", []) or []:
+                walk_class(nested)
+
+        for cls in file_info.get("classes", []) or []:
+            walk_class(cls)
+
+    return _apidoc_dedupe_symbol_lines(queries)
+
+
+def _apidoc_symbol_counts(analysis: _APIDocDict[str, _APIDocAny]) -> _APIDocDict[str, int]:
+    counts = {
+        "files": len(analysis.get("files", []) or []),
+        "imports": 0,
+        "classes": 0,
+        "nested_classes": 0,
+        "functions": 0,
+        "methods": 0,
+        "properties": 0,
+        "fields": 0,
+        "constants": 0,
+        "errors": 0,
+        "queries": len(analysis.get("queries", []) or []),
+    }
+
+    def walk_class(cls: _APIDocDict[str, _APIDocAny], *, nested: bool = False) -> None:
+        counts["classes"] += 1
+        if nested:
+            counts["nested_classes"] += 1
+        counts["fields"] += len(cls.get("fields", []) or [])
+        counts["properties"] += len(cls.get("properties", []) or [])
+        counts["methods"] += len(cls.get("methods", []) or [])
+        counts["methods"] += len(cls.get("class_functions", []) or [])
+        counts["methods"] += len(cls.get("static_functions", []) or [])
+        for child in cls.get("nested_classes", []) or []:
+            walk_class(child, nested=True)
+
+    for file_info in analysis.get("files", []) or []:
+        counts["imports"] += len(file_info.get("imports", []) or [])
+        counts["functions"] += len(file_info.get("functions", []) or [])
+        counts["constants"] += len(file_info.get("constants", []) or [])
+        counts["errors"] += len(file_info.get("errors", []) or [])
+        for cls in file_info.get("classes", []) or []:
+            walk_class(cls)
+
+    return counts
+
+
+def _apidoc_format_symbol_markdown(analysis: _APIDocDict[str, _APIDocAny]) -> str:
+    counts = analysis.get("counts", {}) or {}
+    lines: _APIDocList[str] = [
+        "# APIDoc Symbol Detail Report",
+        "",
+        "## Summary",
+        "",
+        "| Field | Value |",
+        "| --- | ---: |",
+        f"| Files | {counts.get('files', 0)} |",
+        f"| Imports | {counts.get('imports', 0)} |",
+        f"| Classes | {counts.get('classes', 0)} |",
+        f"| Nested classes | {counts.get('nested_classes', 0)} |",
+        f"| Functions | {counts.get('functions', 0)} |",
+        f"| Methods | {counts.get('methods', 0)} |",
+        f"| Properties | {counts.get('properties', 0)} |",
+        f"| Fields / attributes | {counts.get('fields', 0)} |",
+        f"| Constants | {counts.get('constants', 0)} |",
+        f"| Generated APIDoc queries | {counts.get('queries', 0)} |",
+        f"| Parse errors | {counts.get('errors', 0)} |",
+        "",
+    ]
+
+    def one_line_doc(doc: str, max_len: int = 220) -> str:
+        doc = " ".join(str(doc or "").split())
+        if len(doc) > max_len:
+            return doc[: max_len - 3] + "..."
+        return doc
+
+    def format_callable(fn: _APIDocDict[str, _APIDocAny], heading: str = "-") -> None:
+        deco = ", ".join(fn.get("decorators", []) or [])
+        returns = fn.get("returns") or ""
+        sig = fn.get("signature") or "()"
+        lines.append(f"{heading} `{fn.get('qualname', fn.get('name'))}{sig}`")
+        lines.append(f"  - kind: `{fn.get('kind', '')}`")
+        lines.append(f"  - line: `{fn.get('line', 0)}`")
+        if returns:
+            lines.append(f"  - returns: `{returns}`")
+        if deco:
+            lines.append(f"  - decorators: `{deco}`")
+        if fn.get("docstring"):
+            lines.append(f"  - doc: {one_line_doc(fn.get('docstring', ''))}")
+        if fn.get("api_queries"):
+            lines.append(f"  - APIDoc queries: `{', '.join(fn.get('api_queries', [])[:6])}`")
+
+    def format_class(cls: _APIDocDict[str, _APIDocAny], level: int = 3) -> None:
+        hashes = "#" * max(3, level)
+        bases = ", ".join(cls.get("bases", []) or [])
+        deco = ", ".join(cls.get("decorators", []) or [])
+        lines.append(f"{hashes} Class `{cls.get('qualname', cls.get('name'))}`")
+        lines.append("")
+        lines.append(f"- line: `{cls.get('line', 0)}`")
+        if bases:
+            lines.append(f"- bases: `{bases}`")
+        if deco:
+            lines.append(f"- decorators: `{deco}`")
+        if cls.get("docstring"):
+            lines.append(f"- doc: {one_line_doc(cls.get('docstring', ''))}")
+        if cls.get("api_queries"):
+            lines.append(f"- APIDoc queries: `{', '.join(cls.get('api_queries', [])[:8])}`")
+        lines.append("")
+
+        fields = cls.get("fields", []) or []
+        if fields:
+            lines.append("#### Fields / attributes")
+            lines.append("")
+            lines.append("| Name | Kind | Annotation | Value | Line |")
+            lines.append("| --- | --- | --- | --- | ---: |")
+            for field in fields:
+                lines.append(
+                    f"| `{field.get('name','')}` | `{field.get('kind','')}` | "
+                    f"`{str(field.get('annotation','')).replace('|', '\\|')}` | "
+                    f"`{str(field.get('value','')).replace('|', '\\|')}` | "
+                    f"{field.get('line', 0)} |"
+                )
+            lines.append("")
+
+        for title, key in (
+            ("Properties", "properties"),
+            ("Methods", "methods"),
+            ("Class methods", "class_functions"),
+            ("Static methods", "static_functions"),
+        ):
+            items = cls.get(key, []) or []
+            if not items:
+                continue
+            lines.append(f"#### {title}")
+            lines.append("")
+            for fn in items:
+                format_callable(fn)
+            lines.append("")
+
+        for nested in cls.get("nested_classes", []) or []:
+            format_class(nested, level=level + 1)
+
+    for file_info in analysis.get("files", []) or []:
+        lines.append(f"## File `{file_info.get('path', '')}`")
+        lines.append("")
+        lines.append(f"- module: `{file_info.get('module', '')}`")
+        lines.append(f"- language: `{file_info.get('language', '')}`")
+        lines.append("")
+
+        if file_info.get("errors"):
+            lines.append("### Parse errors")
+            for err in file_info.get("errors", []) or []:
+                lines.append(f"- `{err.get('type')}` line `{err.get('line', '')}`: {err.get('message')}")
+            lines.append("")
+
+        imports = file_info.get("imports", []) or []
+        if imports:
+            lines.append("### Imports")
+            lines.append("")
+            lines.append("| Kind | Name | Alias | Line |")
+            lines.append("| --- | --- | --- | ---: |")
+            for imp in imports[:120]:
+                name = imp.get("full_name") or imp.get("name") or ""
+                lines.append(f"| `{imp.get('kind','')}` | `{name}` | `{imp.get('asname') or ''}` | {imp.get('line', 0)} |")
+            if len(imports) > 120:
+                lines.append(f"| ... | `{len(imports) - 120} more` |  |  |")
+            lines.append("")
+
+        constants = file_info.get("constants", []) or []
+        if constants:
+            lines.append("### Module constants / assignments")
+            lines.append("")
+            lines.append("| Name | Kind | Annotation | Value | Line |")
+            lines.append("| --- | --- | --- | --- | ---: |")
+            for field in constants:
+                lines.append(
+                    f"| `{field.get('name','')}` | `{field.get('kind','')}` | "
+                    f"`{str(field.get('annotation','')).replace('|', '\\|')}` | "
+                    f"`{str(field.get('value','')).replace('|', '\\|')}` | "
+                    f"{field.get('line', 0)} |"
+                )
+            lines.append("")
+
+        funcs = file_info.get("functions", []) or []
+        if funcs:
+            lines.append("### Module functions")
+            lines.append("")
+            for fn in funcs:
+                format_callable(fn)
+            lines.append("")
+
+        classes = file_info.get("classes", []) or []
+        if classes:
+            lines.append("### Classes")
+            lines.append("")
+            for cls in classes:
+                format_class(cls, level=4)
+
+    queries = analysis.get("queries", []) or []
+    if queries:
+        lines.append("## Plain APIDoc query lines")
+        lines.append("")
+        lines.append("```text")
+        lines.extend(queries)
+        lines.append("```")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+@_apidoc_dataclass
+class APIDocSymbolScanBlock(BaseBlock):
+    """Return structured symbol details for source: classes, properties, functions, methods, fields, imports, and generated APIDoc queries."""
+
+    def execute(self, payload: _APIDocAny, *, params: _APIDocDict[str, _APIDocAny]) -> _APIDocTuple[_APIDocAny, _APIDocDict[str, _APIDocAny]]:
+        sources = _apidoc_read_symbol_sources(payload, params)
+        files = [_apidoc_parse_python_symbol_source(src["path"], src["code"]) for src in sources]
+        analysis: _APIDocDict[str, _APIDocAny] = {
+            "type": "apidoc-symbol-scan",
+            "version": "2026.06.08-symbol-detail-v1",
+            "files": files,
+            "queries": [],
+            "counts": {},
+        }
+        analysis["queries"] = _apidoc_collect_queries_from_symbol_analysis(analysis)
+        max_queries = int(params.get("max_queries", 100000) or 100000)
+        if max_queries > 0:
+            analysis["queries"] = analysis["queries"][:max_queries]
+        analysis["counts"] = _apidoc_symbol_counts(analysis)
+        return analysis, {"type": "apidoc-symbol-scan", **analysis["counts"]}
+
+    def get_params_info(self) -> _APIDocDict[str, _APIDocAny]:
+        return {
+            "path/source_path/code_file/files/paths": "File, folder, list of files, or inline Python code payload.",
+            "max_files": 80,
+            "max_bytes_per_file": 320000,
+            "max_queries": "100000, or 0/unlimited for no cap",
+            "return_format": "dict",
+        }
+
+
+@_apidoc_dataclass
+class APIDocSymbolReportBlock(BaseBlock):
+    """Return formatted Markdown with classes, properties, methods, functions, fields, signatures, decorators, and APIDoc query lines."""
+
+    def execute(self, payload: _APIDocAny, *, params: _APIDocDict[str, _APIDocAny]) -> _APIDocTuple[str, _APIDocDict[str, _APIDocAny]]:
+        if isinstance(payload, dict) and payload.get("type") == "apidoc-symbol-scan" and isinstance(payload.get("files"), list):
+            analysis = payload
+        else:
+            analysis, _ = APIDocSymbolScanBlock().execute(payload, params=params)
+        md = _apidoc_format_symbol_markdown(analysis)
+        meta = {"type": "apidoc-symbol-report", **(analysis.get("counts", {}) or {})}
+        try:
+            meta.update(_write_optional_text_output(md, params, "apidoc_symbol_detail_report.md"))
+        except Exception:
+            pass
+        return md, meta
+
+    def get_params_info(self) -> _APIDocDict[str, _APIDocAny]:
+        info = APIDocSymbolScanBlock().get_params_info()
+        info.update({"out_path": "Optional output .md file or folder."})
+        return info
+
+
+@_apidoc_dataclass
+class APIDocSymbolQueriesBlock(BaseBlock):
+    """Return newline-separated APIDoc query lines generated from imports/classes/properties/functions/methods/fields."""
+
+    def execute(self, payload: _APIDocAny, *, params: _APIDocDict[str, _APIDocAny]) -> _APIDocTuple[str, _APIDocDict[str, _APIDocAny]]:
+        if isinstance(payload, dict) and payload.get("type") == "apidoc-symbol-scan" and isinstance(payload.get("queries"), list):
+            analysis = payload
+        else:
+            analysis, _ = APIDocSymbolScanBlock().execute(payload, params=params)
+        queries = _apidoc_dedupe_symbol_lines([str(q) for q in analysis.get("queries", []) or []])
+        text = "\n".join(queries).rstrip() + ("\n" if queries else "")
+        meta = {
+            "type": "apidoc-symbol-queries",
+            "query_count": len(queries),
+            "class_count": (analysis.get("counts", {}) or {}).get("classes", 0),
+            "function_count": (analysis.get("counts", {}) or {}).get("functions", 0),
+            "method_count": (analysis.get("counts", {}) or {}).get("methods", 0),
+            "property_count": (analysis.get("counts", {}) or {}).get("properties", 0),
+            "field_count": (analysis.get("counts", {}) or {}).get("fields", 0),
+        }
+        try:
+            meta.update(_write_optional_text_output(text, params, "apidoc_symbol_queries.txt"))
+        except Exception:
+            pass
+        return text, meta
+
+    def get_params_info(self) -> _APIDocDict[str, _APIDocAny]:
+        info = APIDocSymbolScanBlock().get_params_info()
+        info.update({"out_path": "Optional output .txt file or folder."})
+        return info
+
+
+@_apidoc_dataclass
+class APIDocSymbolFetchBlock(BaseBlock):
+    """Scan source symbols, generate detailed APIDoc query lines, then run the normal APIDoc fetch/report pipeline."""
+
+    def execute(self, payload: _APIDocAny, *, params: _APIDocDict[str, _APIDocAny]) -> _APIDocTuple[str, _APIDocDict[str, _APIDocAny]]:
+        analysis, scan_meta = APIDocSymbolScanBlock().execute(payload, params=params)
+        query_text = "\n".join(analysis.get("queries", []) or [])
+        merged = dict(params)
+        merged.setdefault("direct_mode", True)
+        merged.setdefault("search_fallback", False)
+        merged.setdefault("crawl_direct_pages", False)
+        merged.setdefault("output_style", params.get("output_style", "advanced_report"))
+        md, meta = APIDocBlock().execute(query_text, params=merged)
+        meta["symbol_scan"] = scan_meta
+        return md, {"type": "apidoc-symbol-fetch", **meta}
+
+    def get_params_info(self) -> _APIDocDict[str, _APIDocAny]:
+        info = dict(COMMON_PARAMS)
+        info.update(APIDocSymbolScanBlock().get_params_info())
+        info.update({"out_path": "Optional APIDoc markdown output path."})
+        return info
+
+
+# Symbol-detail block registrations.
+BLOCKS.register("apidoc_symbol_scan", APIDocSymbolScanBlock)
+BLOCKS.register("apidoc_class_scan", APIDocSymbolScanBlock)
+BLOCKS.register("apidoc_source_symbols", APIDocSymbolScanBlock)
+BLOCKS.register("apidoc_symbols", APIDocSymbolScanBlock)
+
+BLOCKS.register("apidoc_symbol_report", APIDocSymbolReportBlock)
+# kept existing apidoc_class_report owner; do not overwrite with symbol alias here
+BLOCKS.register("apidoc_source_symbol_report", APIDocSymbolReportBlock)
+
+BLOCKS.register("apidoc_symbol_queries", APIDocSymbolQueriesBlock)
+# kept existing apidoc_class_queries owner; do not overwrite with symbol alias here
+BLOCKS.register("apidoc_source_symbol_queries", APIDocSymbolQueriesBlock)
+
+BLOCKS.register("apidoc_symbol_fetch", APIDocSymbolFetchBlock)
+# kept existing apidoc_class_fetch owner; do not overwrite with symbol alias here
+
+
+# ---------------------------------------------------------------------------
+# Classname-detail APIDoc patch v2
+# ---------------------------------------------------------------------------
+# Adds class-name focused analysis blocks that return specific class details:
+# class matches, bases, decorators, docstrings, class variables, dataclass fields,
+# enum values, properties, instance attributes, methods, classmethods,
+# staticmethods, nested classes, signatures, parameters, return annotations,
+# calls, raises, generated APIDoc query lines, and formatted Markdown reports.
+#
+# Static AST parsing is the default and does not import scanned source files.
+# Optional live import/introspection is disabled unless allow_import=True.
+# ---------------------------------------------------------------------------
+
+import ast
+import difflib
+import importlib
+import inspect
+import pydoc
+import traceback
+from dataclasses import asdict, field, fields as dataclass_fields, is_dataclass
+from typing import Iterable, Sequence
+
+@dataclass
+class APIDocParamInfo:
+    name: str
+    annotation: str = ""
+    default: str = ""
+    kind: str = "arg"
+
+
+@dataclass
+class APIDocFieldInfo:
+    name: str
+    kind: str
+    annotation: str = ""
+    value: str = ""
+    line: int = 0
+    end_line: int = 0
+    scope: str = "class"
+    detected_from: str = "ast"
+    decorators: List[str] = field(default_factory=list)
+
+
+@dataclass
+class APIDocCallableInfo:
+    name: str
+    qualname: str
+    kind: str
+    signature: str = ""
+    returns: str = ""
+    docstring: str = ""
+    line: int = 0
+    end_line: int = 0
+    decorators: List[str] = field(default_factory=list)
+    parameters: List[APIDocParamInfo] = field(default_factory=list)
+    raises: List[str] = field(default_factory=list)
+    calls: List[str] = field(default_factory=list)
+    returns_expression: str = ""
+    api_queries: List[str] = field(default_factory=list)
+
+
+@dataclass
+class APIDocClassInfo:
+    name: str
+    qualname: str
+    module: str = ""
+    file_path: str = ""
+    language: str = "python"
+    line: int = 0
+    end_line: int = 0
+    bases: List[str] = field(default_factory=list)
+    keywords: Dict[str, str] = field(default_factory=dict)
+    decorators: List[str] = field(default_factory=list)
+    docstring: str = ""
+    type_params: List[str] = field(default_factory=list)
+    class_variables: List[APIDocFieldInfo] = field(default_factory=list)
+    dataclass_fields: List[APIDocFieldInfo] = field(default_factory=list)
+    enum_values: List[APIDocFieldInfo] = field(default_factory=list)
+    properties: List[APIDocCallableInfo] = field(default_factory=list)
+    methods: List[APIDocCallableInfo] = field(default_factory=list)
+    class_methods: List[APIDocCallableInfo] = field(default_factory=list)
+    static_methods: List[APIDocCallableInfo] = field(default_factory=list)
+    nested_classes: List["APIDocClassInfo"] = field(default_factory=list)
+    instance_attributes: List[APIDocFieldInfo] = field(default_factory=list)
+    inherited_from: List[str] = field(default_factory=list)
+    api_queries: List[str] = field(default_factory=list)
+    match_score: float = 1.0
+    match_reason: str = "exact"
+
+
+@dataclass
+class APIDocModuleInfo:
+    path: str
+    module: str
+    language: str = "python"
+    imports: List[Dict[str, Any]] = field(default_factory=list)
+    functions: List[APIDocCallableInfo] = field(default_factory=list)
+    constants: List[APIDocFieldInfo] = field(default_factory=list)
+    classes: List[APIDocClassInfo] = field(default_factory=list)
+    errors: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def _safe_asdict(value: Any) -> Any:
+    if isinstance(value, (APIDocParamInfo, APIDocFieldInfo, APIDocCallableInfo, APIDocClassInfo, APIDocModuleInfo)):
+        return asdict(value)
+    if isinstance(value, dict):
+        return {str(k): _safe_asdict(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_safe_asdict(v) for v in value]
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except Exception:
+            return str(value)
+    return value
+
+
+def _dedupe(items: Iterable[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for item in items:
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _unparse(node: Any) -> str:
+    if node is None:
+        return ""
+    try:
+        return ast.unparse(node)
+    except Exception:
+        try:
+            return repr(node)
+        except Exception:
+            return ""
+
+
+def _shorten(text: Any, width: int = 220) -> str:
+    raw = " ".join(str(text or "").split())
+    if len(raw) <= width:
+        return raw
+    return raw[: max(0, width - 3)] + "..."
+
+
+def _decorator_name(node: ast.AST) -> str:
+    text = _unparse(node)
+    if text:
+        return text
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return _decorator_name(node.func)
+    return node.__class__.__name__
+
+
+def _name_from_attr(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _name_from_attr(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    if isinstance(node, ast.Subscript):
+        return _unparse(node)
+    if isinstance(node, ast.Call):
+        return _name_from_attr(node.func)
+    return _unparse(node)
+
+
+def _module_name_from_path(path: str) -> str:
+    try:
+        p = Path(path)
+        if p.suffix:
+            return p.stem
+        if str(path).startswith("inline"):
+            return "inline"
+        return p.name or "module"
+    except Exception:
+        return "module"
+
+
+def _targets_to_names(target: Any) -> List[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Attribute):
+        return [_unparse(target)]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        out: List[str] = []
+        for child in target.elts:
+            out.extend(_targets_to_names(child))
+        return out
+    return []
+
+
+def _is_self_attr(target: Any) -> Optional[str]:
+    if not isinstance(target, ast.Attribute):
+        return None
+    if isinstance(target.value, ast.Name) and target.value.id in {"self", "cls"}:
+        return target.attr
+    return None
+
+
+def _literal_or_source(node: Any, max_len: int = 180) -> str:
+    if node is None:
+        return ""
+    try:
+        value = ast.literal_eval(node)
+        return _shorten(repr(value), max_len)
+    except Exception:
+        return _shorten(_unparse(node), max_len)
+
+
+def _parse_json_maybe(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _coerce_classnames(value: Any) -> List[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        parsed = _parse_json_maybe(value.strip())
+        if isinstance(parsed, (list, dict)):
+            return _coerce_classnames(parsed)
+
+        parts: List[str] = []
+        for line in value.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("- "):
+                line = line[2:].strip()
+            if "," in line and not re.search(r"\w+\.\w+\(", line):
+                parts.extend(p.strip() for p in line.split(",") if p.strip())
+            else:
+                parts.append(line)
+        return _dedupe(parts)
+
+    if isinstance(value, dict):
+        for key in ("classnames", "class_names", "classes", "names", "query", "queries"):
+            if key in value:
+                return _coerce_classnames(value[key])
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        out: List[str] = []
+        for item in value:
+            out.extend(_coerce_classnames(item))
+        return _dedupe(out)
+
+    return [str(value)]
+
+
+def _normalize_classname(name: str) -> str:
+    text = str(name or "").strip()
+    text = text.replace("`", "").replace("'", "").replace('"', "")
+    text = text.strip()
+    if text.startswith("class "):
+        text = text[6:].strip()
+    text = text.split("(")[0].strip()
+    return text
+
+
+def _simple_classname(name: str) -> str:
+    text = _normalize_classname(name)
+    return text.rsplit(".", 1)[-1]
+
+
+def _class_match_score(requested: str, candidate: APIDocClassInfo) -> Tuple[float, str]:
+    req = _normalize_classname(requested)
+    req_simple = _simple_classname(req)
+    cand_names = [
+        candidate.name,
+        candidate.qualname,
+        f"{candidate.module}.{candidate.qualname}" if candidate.module else candidate.qualname,
+    ]
+
+    for cand in cand_names:
+        if req == cand:
+            return 1.0, "exact"
+    for cand in cand_names:
+        if req.lower() == cand.lower():
+            return 0.99, "case_insensitive_exact"
+    if req_simple.lower() == candidate.name.lower():
+        return 0.95, "simple_name_exact"
+
+    best = 0.0
+    for cand in cand_names:
+        best = max(best, difflib.SequenceMatcher(None, req.lower(), cand.lower()).ratio())
+    if best >= 0.72:
+        return best, "fuzzy"
+    if req.lower() in candidate.qualname.lower() or req.lower() in candidate.name.lower():
+        return 0.70, "substring"
+
+    return best, "weak"
+
+
+def _param_infos(fn: ast.AST) -> List[APIDocParamInfo]:
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return []
+
+    args_obj = fn.args
+    out: List[APIDocParamInfo] = []
+
+    defaults = list(args_obj.defaults or [])
+    positional = list(getattr(args_obj, "posonlyargs", []) or []) + list(args_obj.args or [])
+    default_offset = len(positional) - len(defaults)
+
+    for index, arg in enumerate(positional):
+        default = ""
+        if index >= default_offset and defaults:
+            default = _literal_or_source(defaults[index - default_offset])
+        out.append(
+            APIDocParamInfo(
+                name=arg.arg,
+                annotation=_unparse(arg.annotation),
+                default=default,
+                kind="positional",
+            )
+        )
+
+    if args_obj.vararg:
+        out.append(
+            APIDocParamInfo(
+                name=args_obj.vararg.arg,
+                annotation=_unparse(args_obj.vararg.annotation),
+                kind="vararg",
+            )
+        )
+
+    kw_defaults = list(args_obj.kw_defaults or [])
+    for arg, default_node in zip(args_obj.kwonlyargs or [], kw_defaults):
+        out.append(
+            APIDocParamInfo(
+                name=arg.arg,
+                annotation=_unparse(arg.annotation),
+                default=_literal_or_source(default_node) if default_node is not None else "",
+                kind="keyword_only",
+            )
+        )
+
+    if args_obj.kwarg:
+        out.append(
+            APIDocParamInfo(
+                name=args_obj.kwarg.arg,
+                annotation=_unparse(args_obj.kwarg.annotation),
+                kind="kwarg",
+            )
+        )
+
+    return out
+
+
+def _signature_from_params(params: Sequence[APIDocParamInfo], returns: str = "") -> str:
+    pieces: List[str] = []
+    for p in params:
+        prefix = ""
+        if p.kind == "vararg":
+            prefix = "*"
+        elif p.kind == "kwarg":
+            prefix = "**"
+
+        text = f"{prefix}{p.name}"
+        if p.annotation:
+            text += f": {p.annotation}"
+        if p.default:
+            text += f" = {p.default}"
+        pieces.append(text)
+
+    sig = f"({', '.join(pieces)})"
+    if returns:
+        sig += f" -> {returns}"
+    return sig
+
+
+def _call_names_inside(node: ast.AST) -> List[str]:
+    calls: List[str] = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            name = _name_from_attr(child.func)
+            if name:
+                calls.append(name)
+    return _dedupe(calls)
+
+
+def _raise_names_inside(node: ast.AST) -> List[str]:
+    raises: List[str] = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Raise) and child.exc is not None:
+            raises.append(_name_from_attr(child.exc) or _unparse(child.exc))
+    return _dedupe(raises)
+
+
+def _return_expr_inside(fn: ast.AST) -> str:
+    returns_found: List[str] = []
+    for child in ast.walk(fn):
+        if isinstance(child, ast.Return) and child.value is not None:
+            returns_found.append(_literal_or_source(child.value))
+    return "; ".join(returns_found[:5])
+
+
+def _callable_from_node(
+    fn: ast.AST,
+    *,
+    qualprefix: str = "",
+    module_name: str = "",
+    kind: str = "function",
+) -> APIDocCallableInfo:
+    name = getattr(fn, "name", "")
+    qualname = f"{qualprefix}.{name}" if qualprefix else name
+    params = _param_infos(fn)
+    returns = _unparse(getattr(fn, "returns", None))
+    signature = _signature_from_params(params, returns)
+    full_query = f"{module_name}.{qualname}" if module_name else qualname
+
+    return APIDocCallableInfo(
+        name=name,
+        qualname=qualname,
+        kind=kind,
+        signature=signature,
+        returns=returns,
+        docstring=ast.get_docstring(fn) or "",
+        line=int(getattr(fn, "lineno", 0) or 0),
+        end_line=int(getattr(fn, "end_lineno", 0) or 0),
+        decorators=[_decorator_name(d) for d in getattr(fn, "decorator_list", [])],
+        parameters=params,
+        raises=_raise_names_inside(fn),
+        calls=_call_names_inside(fn),
+        returns_expression=_return_expr_inside(fn),
+        api_queries=_dedupe([full_query, qualname, name]),
+    )
+
+
+def _method_kind(fn: ast.AST) -> str:
+    decorators = [_decorator_name(d).lower() for d in getattr(fn, "decorator_list", [])]
+    if any(d == "property" or d.endswith(".property") or d == "cached_property" or d.endswith(".cached_property") for d in decorators):
+        return "property"
+    if any(d.endswith(".setter") for d in decorators):
+        return "property_setter"
+    if any(d.endswith(".deleter") for d in decorators):
+        return "property_deleter"
+    if "classmethod" in decorators:
+        return "class_method"
+    if "staticmethod" in decorators:
+        return "static_method"
+    if isinstance(fn, ast.AsyncFunctionDef):
+        return "async_method"
+    return "method"
+
+
+def _instance_attrs_from_function(fn: ast.AST) -> List[APIDocFieldInfo]:
+    out: List[APIDocFieldInfo] = []
+
+    for node in ast.walk(fn):
+        if isinstance(node, ast.AnnAssign):
+            attr = _is_self_attr(node.target)
+            if attr:
+                out.append(
+                    APIDocFieldInfo(
+                        name=attr,
+                        kind="instance_attribute",
+                        annotation=_unparse(node.annotation),
+                        value=_literal_or_source(node.value),
+                        line=int(getattr(node, "lineno", 0) or 0),
+                        end_line=int(getattr(node, "end_lineno", 0) or 0),
+                        scope="instance",
+                        detected_from=f"{getattr(fn, 'name', '')}.annassign",
+                    )
+                )
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                attr = _is_self_attr(target)
+                if attr:
+                    out.append(
+                        APIDocFieldInfo(
+                            name=attr,
+                            kind="instance_attribute",
+                            value=_literal_or_source(node.value),
+                            line=int(getattr(node, "lineno", 0) or 0),
+                            end_line=int(getattr(node, "end_lineno", 0) or 0),
+                            scope="instance",
+                            detected_from=f"{getattr(fn, 'name', '')}.assign",
+                        )
+                    )
+
+    seen: Set[Tuple[str, int]] = set()
+    final: List[APIDocFieldInfo] = []
+    for item in out:
+        key = (item.name, item.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        final.append(item)
+    return final
+
+
+def _field_from_annassign(node: ast.AnnAssign, *, scope: str = "class") -> List[APIDocFieldInfo]:
+    return [
+        APIDocFieldInfo(
+            name=name,
+            kind="annotated_attribute",
+            annotation=_unparse(node.annotation),
+            value=_literal_or_source(node.value),
+            line=int(getattr(node, "lineno", 0) or 0),
+            end_line=int(getattr(node, "end_lineno", 0) or 0),
+            scope=scope,
+        )
+        for name in _targets_to_names(node.target)
+    ]
+
+
+def _field_from_assign(node: ast.Assign, *, scope: str = "class") -> List[APIDocFieldInfo]:
+    out: List[APIDocFieldInfo] = []
+    for target in node.targets:
+        for name in _targets_to_names(target):
+            out.append(
+                APIDocFieldInfo(
+                    name=name,
+                    kind="assignment",
+                    value=_literal_or_source(node.value),
+                    line=int(getattr(node, "lineno", 0) or 0),
+                    end_line=int(getattr(node, "end_lineno", 0) or 0),
+                    scope=scope,
+                )
+            )
+    return out
+
+
+def _is_dataclass_decorator(decorator: str) -> bool:
+    d = decorator.lower()
+    return d == "dataclass" or d == "dataclasses.dataclass" or d.startswith("dataclass(") or d.startswith("dataclasses.dataclass(")
+
+
+def _is_enum_base(base: str) -> bool:
+    b = base.lower()
+    return b in {"enum", "enum.enum", "intenum", "strenum", "enum.intenum", "enum.strenum"} or b.endswith(".enum")
+
+
+def _split_dataclass_fields(cls_info: APIDocClassInfo) -> None:
+    if not any(_is_dataclass_decorator(d) for d in cls_info.decorators):
+        return
+
+    data_fields: List[APIDocFieldInfo] = []
+    remain: List[APIDocFieldInfo] = []
+    for field_info in cls_info.class_variables:
+        if field_info.annotation:
+            field_info.kind = "dataclass_field"
+            data_fields.append(field_info)
+        else:
+            remain.append(field_info)
+
+    cls_info.dataclass_fields.extend(data_fields)
+    cls_info.class_variables = remain
+
+
+def _split_enum_values(cls_info: APIDocClassInfo) -> None:
+    if not any(_is_enum_base(b) for b in cls_info.bases):
+        return
+
+    enum_values: List[APIDocFieldInfo] = []
+    remain: List[APIDocFieldInfo] = []
+    for field_info in cls_info.class_variables:
+        if field_info.name.isupper() or field_info.kind == "assignment":
+            field_info.kind = "enum_value"
+            enum_values.append(field_info)
+        else:
+            remain.append(field_info)
+
+    cls_info.enum_values.extend(enum_values)
+    cls_info.class_variables = remain
+
+
+def _class_from_node(
+    cls: ast.ClassDef,
+    *,
+    module_name: str,
+    file_path: str,
+    qualprefix: str = "",
+) -> APIDocClassInfo:
+    qualname = f"{qualprefix}.{cls.name}" if qualprefix else cls.name
+    full = f"{module_name}.{qualname}" if module_name else qualname
+
+    info = APIDocClassInfo(
+        name=cls.name,
+        qualname=qualname,
+        module=module_name,
+        file_path=file_path,
+        line=int(getattr(cls, "lineno", 0) or 0),
+        end_line=int(getattr(cls, "end_lineno", 0) or 0),
+        bases=[_unparse(b) for b in cls.bases],
+        keywords={kw.arg or "": _unparse(kw.value) for kw in cls.keywords},
+        decorators=[_decorator_name(d) for d in cls.decorator_list],
+        docstring=ast.get_docstring(cls) or "",
+        type_params=[_unparse(tp) for tp in getattr(cls, "type_params", [])],
+        api_queries=_dedupe([full, qualname, cls.name]),
+    )
+
+    for child in cls.body:
+        if isinstance(child, ast.AnnAssign):
+            info.class_variables.extend(_field_from_annassign(child))
+        elif isinstance(child, ast.Assign):
+            info.class_variables.extend(_field_from_assign(child))
+        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kind = _method_kind(child)
+            fn = _callable_from_node(child, qualprefix=qualname, module_name=module_name, kind=kind)
+            info.instance_attributes.extend(_instance_attrs_from_function(child))
+
+            if kind.startswith("property"):
+                info.properties.append(fn)
+            elif kind == "class_method":
+                info.class_methods.append(fn)
+            elif kind == "static_method":
+                info.static_methods.append(fn)
+            else:
+                info.methods.append(fn)
+        elif isinstance(child, ast.ClassDef):
+            info.nested_classes.append(
+                _class_from_node(child, module_name=module_name, file_path=file_path, qualprefix=qualname)
+            )
+
+    info.inherited_from = [base for base in info.bases if base]
+    _split_dataclass_fields(info)
+    _split_enum_values(info)
+
+    seen_attrs: Set[str] = set()
+    deduped_attrs: List[APIDocFieldInfo] = []
+    for item in info.instance_attributes:
+        if item.name in seen_attrs:
+            continue
+        seen_attrs.add(item.name)
+        deduped_attrs.append(item)
+    info.instance_attributes = deduped_attrs
+
+    return info
+
+
+def _parse_python_source(path: str, code: str) -> APIDocModuleInfo:
+    module = _module_name_from_path(path)
+    info = APIDocModuleInfo(path=path, module=module)
+
+    try:
+        tree = ast.parse(code, filename=path, type_comments=True)
+    except SyntaxError as exc:
+        info.errors.append(
+            {
+                "type": "SyntaxError",
+                "message": str(exc),
+                "line": int(getattr(exc, "lineno", 0) or 0),
+                "offset": int(getattr(exc, "offset", 0) or 0),
+            }
+        )
+        return info
+    except Exception as exc:
+        info.errors.append({"type": exc.__class__.__name__, "message": str(exc)})
+        return info
+
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                info.imports.append(
+                    {
+                        "kind": "import",
+                        "name": alias.name,
+                        "asname": alias.asname,
+                        "line": int(getattr(node, "lineno", 0) or 0),
+                    }
+                )
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            for alias in node.names:
+                full = f"{mod}.{alias.name}" if mod else alias.name
+                info.imports.append(
+                    {
+                        "kind": "from_import",
+                        "module": mod,
+                        "name": alias.name,
+                        "full_name": full,
+                        "asname": alias.asname,
+                        "level": int(getattr(node, "level", 0) or 0),
+                        "line": int(getattr(node, "lineno", 0) or 0),
+                    }
+                )
+        elif isinstance(node, ast.ClassDef):
+            info.classes.append(_class_from_node(node, module_name=module, file_path=path))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            info.functions.append(
+                _callable_from_node(
+                    node,
+                    module_name=module,
+                    kind="async_function" if isinstance(node, ast.AsyncFunctionDef) else "function",
+                )
+            )
+        elif isinstance(node, ast.AnnAssign):
+            info.constants.extend(_field_from_annassign(node, scope="module"))
+        elif isinstance(node, ast.Assign):
+            info.constants.extend(_field_from_assign(node, scope="module"))
+
+    return info
+
+
+def _walk_classes(classes: Iterable[APIDocClassInfo]) -> Iterable[APIDocClassInfo]:
+    for cls in classes:
+        yield cls
+        yield from _walk_classes(cls.nested_classes)
+
+
+def _all_classes(modules: Iterable[APIDocModuleInfo]) -> List[APIDocClassInfo]:
+    out: List[APIDocClassInfo] = []
+    for mod in modules:
+        out.extend(list(_walk_classes(mod.classes)))
+    return out
+
+
+def _read_sources(payload: Any, params: Dict[str, Any]) -> List[Dict[str, str]]:
+    max_bytes = int(params.get("max_bytes_per_file", 1_000_000) or 1_000_000)
+    max_files = int(params.get("max_files", 250) or 250)
+    include_patterns = params.get("include_patterns") or ["*.py"]
+    if isinstance(include_patterns, str):
+        include_patterns = [p.strip() for p in include_patterns.split(",") if p.strip()]
+    sources: List[Dict[str, str]] = []
+
+    def add_code(label: str, source_code: str) -> None:
+        if not source_code:
+            return
+        sources.append({"path": label, "code": str(source_code)[:max_bytes]})
+
+    def add_path(pathish: Any) -> None:
+        try:
+            p = Path(str(pathish)).expanduser()
+            if p.is_file():
+                if p.suffix.lower() in {".py", ".pyw", ".txt", ".md"}:
+                    add_code(str(p), p.read_text(encoding="utf-8", errors="replace"))
+            elif p.is_dir():
+                count = 0
+                for pattern in include_patterns:
+                    for child in p.rglob(pattern):
+                        if count >= max_files:
+                            return
+                        if child.is_file():
+                            add_code(str(child), child.read_text(encoding="utf-8", errors="replace"))
+                            count += 1
+        except Exception:
+            pass
+
+    def add_any(value: Any, label: str = "inline") -> None:
+        if value is None:
+            return
+
+        if isinstance(value, dict):
+            for key in ("code", "source", "text", "content"):
+                if isinstance(value.get(key), str):
+                    add_code(f"inline:{key}", value[key])
+            for key in ("path", "source_path", "code_file", "file", "folder", "directory"):
+                if value.get(key):
+                    add_path(value[key])
+            for key in ("paths", "files", "folders", "directories"):
+                if isinstance(value.get(key), list):
+                    for item in value[key]:
+                        add_path(item)
+            return
+
+        if isinstance(value, (list, tuple, set)):
+            for i, item in enumerate(value):
+                add_any(item, f"inline:{i}")
+            return
+
+        if isinstance(value, str):
+            text = value
+            looks_like_code = "\n" in text or text.strip().startswith(("class ", "def ", "async def ", "from ", "import ", "@"))
+            if looks_like_code:
+                add_code(label, text)
+            else:
+                add_path(text)
+
+    add_any(payload)
+
+    if not sources and isinstance(payload, str):
+        add_code("inline", payload)
+
+    seen: Set[str] = set()
+    out: List[Dict[str, str]] = []
+    for src in sources:
+        key = src["path"]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(src)
+    return out[:max_files]
+
+
+def _live_import_class(dotted: str) -> Tuple[Optional[type], str]:
+    dotted = _normalize_classname(dotted)
+    parts = dotted.split(".")
+    if len(parts) < 2:
+        return None, "Need dotted module.ClassName for live import."
+
+    errors: List[str] = []
+    for split_at in range(len(parts) - 1, 0, -1):
+        module_name = ".".join(parts[:split_at])
+        attrs = parts[split_at:]
+        try:
+            module = importlib.import_module(module_name)
+            obj: Any = module
+            for attr in attrs:
+                obj = getattr(obj, attr)
+            if inspect.isclass(obj):
+                return obj, ""
+            return None, f"{dotted!r} resolved but is not a class."
+        except Exception as exc:
+            errors.append(f"{module_name}: {exc}")
+    return None, "; ".join(errors[-3:])
+
+
+def _field_info_from_live_dataclass(cls: type) -> List[APIDocFieldInfo]:
+    out: List[APIDocFieldInfo] = []
+    try:
+        if not is_dataclass(cls):
+            return out
+        for f in dataclass_fields(cls):
+            default = ""
+            try:
+                default = repr(f.default)
+                if "MISSING_TYPE" in default:
+                    default = ""
+            except Exception:
+                default = ""
+            out.append(
+                APIDocFieldInfo(
+                    name=f.name,
+                    kind="live_dataclass_field",
+                    annotation=getattr(f.type, "__name__", repr(f.type)),
+                    value=default,
+                    scope="class",
+                    detected_from="inspect.dataclasses.fields",
+                )
+            )
+    except Exception:
+        pass
+    return out
+
+
+def _live_class_info(dotted: str) -> Dict[str, Any]:
+    cls, err = _live_import_class(dotted)
+    if cls is None:
+        return {"requested": dotted, "enabled": False, "error": err}
+
+    out: Dict[str, Any] = {
+        "requested": dotted,
+        "enabled": True,
+        "name": getattr(cls, "__name__", ""),
+        "qualname": getattr(cls, "__qualname__", ""),
+        "module": getattr(cls, "__module__", ""),
+        "docstring": inspect.getdoc(cls) or "",
+        "mro": [getattr(c, "__module__", "") + "." + getattr(c, "__qualname__", "") for c in getattr(cls, "__mro__", [])],
+        "dataclass_fields": _safe_asdict(_field_info_from_live_dataclass(cls)),
+        "members": [],
+        "signature": "",
+    }
+
+    try:
+        out["signature"] = str(inspect.signature(cls))
+    except Exception:
+        out["signature"] = ""
+
+    try:
+        members = inspect.getmembers_static(cls)
+    except Exception:
+        members = []
+
+    for name, value in members:
+        if name.startswith("__") and name.endswith("__"):
+            continue
+
+        kind = type(value).__name__
+        if isinstance(value, property):
+            kind = "property"
+        elif isinstance(value, staticmethod):
+            kind = "staticmethod"
+        elif isinstance(value, classmethod):
+            kind = "classmethod"
+        elif inspect.isfunction(value):
+            kind = "function"
+
+        item = {"name": name, "kind": kind, "docstring": "", "signature": ""}
+
+        try:
+            target = value
+            if isinstance(value, (staticmethod, classmethod)):
+                target = value.__func__
+            item["docstring"] = inspect.getdoc(target) or ""
+            if callable(target):
+                item["signature"] = str(inspect.signature(target))
+        except Exception:
+            pass
+
+        out["members"].append(item)
+
+    return out
+
+
+def _index_modules(payload: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+    sources = _read_sources(payload, params)
+    modules = [_parse_python_source(src["path"], src["code"]) for src in sources]
+    classes = _all_classes(modules)
+    return {
+        "type": "apidoc-source-class-index",
+        "version": "2026.06.08-classname-detail-v2",
+        "sources": [{"path": src["path"], "bytes": len(src["code"])} for src in sources],
+        "modules": _safe_asdict(modules),
+        "class_index": _safe_asdict(classes),
+        "counts": {
+            "sources": len(sources),
+            "modules": len(modules),
+            "classes": len(classes),
+            "functions": sum(len(m.functions) for m in modules),
+            "imports": sum(len(m.imports) for m in modules),
+            "parse_errors": sum(len(m.errors) for m in modules),
+        },
+    }
+
+
+def _requested_names_from_payload(payload: Any, params: Dict[str, Any]) -> List[str]:
+    if params.get("classnames") is not None:
+        return [_normalize_classname(x) for x in _coerce_classnames(params.get("classnames"))]
+    if params.get("class_names") is not None:
+        return [_normalize_classname(x) for x in _coerce_classnames(params.get("class_names"))]
+    if isinstance(payload, dict):
+        for key in ("classnames", "class_names", "classes", "names", "query", "queries"):
+            if key in payload:
+                return [_normalize_classname(x) for x in _coerce_classnames(payload[key])]
+    return [_normalize_classname(x) for x in _coerce_classnames(payload)]
+
+
+def _source_payload_from_payload(payload: Any, params: Dict[str, Any]) -> Any:
+    if params.get("source_path") or params.get("path") or params.get("files") or params.get("paths"):
+        return {
+            "path": params.get("source_path") or params.get("path"),
+            "files": params.get("files"),
+            "paths": params.get("paths"),
+        }
+    if isinstance(payload, dict):
+        if any(k in payload for k in ("code", "source", "text", "content", "path", "source_path", "files", "paths", "folder", "directory")):
+            return payload
+    return params.get("source") or params.get("code") or params.get("project_path") or payload
+
+
+def _match_classes(index: Dict[str, Any], requested: List[str], params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    threshold = float(params.get("match_threshold", 0.70) or 0.70)
+    max_matches = int(params.get("max_matches_per_class", 10) or 10)
+
+    class_objects: List[APIDocClassInfo] = []
+    for mod in index.get("_raw_modules", []) or []:
+        class_objects.extend(_all_classes([mod]))
+
+    results: List[Dict[str, Any]] = []
+
+    for req in requested:
+        matches: List[APIDocClassInfo] = []
+        for cls in class_objects:
+            score, reason = _class_match_score(req, cls)
+            if score >= threshold:
+                clone = APIDocClassInfo(**{**cls.__dict__})
+                clone.match_score = float(score)
+                clone.match_reason = reason
+                matches.append(clone)
+
+        matches.sort(key=lambda c: (c.match_score, -len(c.qualname)), reverse=True)
+        matches = matches[:max_matches]
+
+        live_info = None
+        if bool(params.get("allow_import", False)) and "." in req:
+            live_info = _live_class_info(req)
+
+        results.append(
+            {
+                "requested": req,
+                "matches": _safe_asdict(matches),
+                "live_introspection": live_info,
+                "found": bool(matches) or bool(live_info and live_info.get("enabled")),
+                "best_match": _safe_asdict(matches[0]) if matches else None,
+            }
+        )
+
+    return results
+
+
+def _queries_from_class(cls: Dict[str, Any]) -> List[str]:
+    queries: List[str] = []
+
+    def add(x: Any) -> None:
+        if x:
+            queries.append(str(x))
+
+    module = cls.get("module") or ""
+    qualname = cls.get("qualname") or cls.get("name") or ""
+
+    add(f"{module}.{qualname}" if module else qualname)
+    add(qualname)
+    add(cls.get("name"))
+
+    for base in cls.get("bases", []) or []:
+        add(base)
+
+    for field_group in ("class_variables", "dataclass_fields", "enum_values", "instance_attributes"):
+        for item in cls.get(field_group, []) or []:
+            add(f"{qualname}.{item.get('name')}")
+            if item.get("annotation"):
+                add(item.get("annotation"))
+
+    for group in ("properties", "methods", "class_methods", "static_methods"):
+        for fn in cls.get(group, []) or []:
+            for q in fn.get("api_queries", []) or []:
+                add(q)
+            for p in fn.get("parameters", []) or []:
+                if p.get("annotation"):
+                    add(p.get("annotation"))
+            if fn.get("returns"):
+                add(fn.get("returns"))
+
+    for nested in cls.get("nested_classes", []) or []:
+        queries.extend(_queries_from_class(nested))
+
+    return _dedupe(queries)
+
+
+def _all_queries_from_matches(matches: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for item in matches:
+        for cls in item.get("matches", []) or []:
+            out.extend(_queries_from_class(cls))
+        live = item.get("live_introspection")
+        if live and live.get("enabled"):
+            out.append(f"{live.get('module')}.{live.get('qualname')}")
+            for mem in live.get("members", []) or []:
+                out.append(f"{live.get('module')}.{live.get('qualname')}.{mem.get('name')}")
+    return _dedupe(out)
+
+
+def _format_member_table(title: str, items: List[Dict[str, Any]], *, include_signature: bool = False) -> List[str]:
+    lines: List[str] = []
+    if not items:
+        return lines
+    lines.append(f"#### {title}")
+    lines.append("")
+    if include_signature:
+        lines.append("| Name | Kind | Signature | Returns | Line |")
+        lines.append("| --- | --- | --- | --- | ---: |")
+        for item in items:
+            sig = str(item.get("signature", "")).replace("|", "\\|")
+            returns = str(item.get("returns", "")).replace("|", "\\|")
+            lines.append(f"| `{item.get('name','')}` | `{item.get('kind','')}` | `{sig}` | `{returns}` | {item.get('line', 0)} |")
+    else:
+        lines.append("| Name | Kind | Annotation | Value | Line |")
+        lines.append("| --- | --- | --- | --- | ---: |")
+        for item in items:
+            ann = str(item.get("annotation", "")).replace("|", "\\|")
+            val = str(item.get("value", "")).replace("|", "\\|")
+            lines.append(f"| `{item.get('name','')}` | `{item.get('kind','')}` | `{ann}` | `{val}` | {item.get('line', 0)} |")
+    lines.append("")
+    return lines
+
+
+def _format_class_markdown(cls: Dict[str, Any], level: int = 3) -> List[str]:
+    h = "#" * max(3, level)
+    lines: List[str] = []
+    display = cls.get("qualname") or cls.get("name")
+    full = f"{cls.get('module')}.{display}" if cls.get("module") else display
+
+    lines.append(f"{h} `{full}`")
+    lines.append("")
+    lines.append(f"- match: `{cls.get('match_reason', 'exact')}` score `{float(cls.get('match_score', 1.0)):.3f}`")
+    lines.append(f"- file: `{cls.get('file_path', '')}`")
+    lines.append(f"- lines: `{cls.get('line', 0)}-{cls.get('end_line', 0)}`")
+
+    if cls.get("bases"):
+        lines.append(f"- bases: `{', '.join(cls.get('bases', []))}`")
+    if cls.get("decorators"):
+        lines.append(f"- decorators: `{', '.join(cls.get('decorators', []))}`")
+    if cls.get("type_params"):
+        lines.append(f"- type params: `{', '.join(cls.get('type_params', []))}`")
+    if cls.get("docstring"):
+        lines.append(f"- doc: {_shorten(cls.get('docstring'), 420)}")
+    if cls.get("api_queries"):
+        lines.append(f"- APIDoc queries: `{', '.join(cls.get('api_queries', [])[:8])}`")
+    lines.append("")
+
+    for title, key, sig in [
+        ("Dataclass fields", "dataclass_fields", False),
+        ("Enum values", "enum_values", False),
+        ("Class variables / attributes", "class_variables", False),
+        ("Instance attributes", "instance_attributes", False),
+        ("Properties", "properties", True),
+        ("Methods", "methods", True),
+        ("Class methods", "class_methods", True),
+        ("Static methods", "static_methods", True),
+    ]:
+        lines.extend(_format_member_table(title, cls.get(key, []) or [], include_signature=sig))
+
+    for fn_group in ("properties", "methods", "class_methods", "static_methods"):
+        for fn in cls.get(fn_group, []) or []:
+            if fn.get("docstring") or fn.get("calls") or fn.get("raises"):
+                lines.append(f"##### `{fn.get('qualname')}{fn.get('signature', '')}`")
+                lines.append("")
+                if fn.get("docstring"):
+                    lines.append(f"- doc: {_shorten(fn.get('docstring'), 320)}")
+                if fn.get("calls"):
+                    lines.append(f"- calls: `{', '.join(fn.get('calls', [])[:12])}`")
+                if fn.get("raises"):
+                    lines.append(f"- raises: `{', '.join(fn.get('raises', [])[:8])}`")
+                if fn.get("returns_expression"):
+                    lines.append(f"- returns expression: `{_shorten(fn.get('returns_expression'), 160)}`")
+                lines.append("")
+
+    for nested in cls.get("nested_classes", []) or []:
+        lines.extend(_format_class_markdown(nested, level=level + 1))
+
+    return lines
+
+
+def _format_report(result: Dict[str, Any]) -> str:
+    lines: List[str] = [
+        "# APIDoc Classname Detail Report",
+        "",
+        "## Summary",
+        "",
+        "| Field | Value |",
+        "| --- | ---: |",
+        f"| Requested classnames | {len(result.get('requested', []) or [])} |",
+        f"| Found requests | {sum(1 for x in result.get('results', []) or [] if x.get('found'))} |",
+        f"| Source files | {result.get('index_counts', {}).get('sources', 0)} |",
+        f"| Indexed classes | {result.get('index_counts', {}).get('classes', 0)} |",
+        f"| Indexed functions | {result.get('index_counts', {}).get('functions', 0)} |",
+        f"| Parse errors | {result.get('index_counts', {}).get('parse_errors', 0)} |",
+        f"| Generated query lines | {len(result.get('queries', []) or [])} |",
+        "",
+    ]
+
+    for item in result.get("results", []) or []:
+        lines.append(f"## Request `{item.get('requested')}`")
+        lines.append("")
+        if not item.get("found"):
+            lines.append("No matching class was found.")
+            lines.append("")
+            continue
+
+        matches = item.get("matches", []) or []
+        if matches:
+            lines.append(f"Found `{len(matches)}` static match(es).")
+            lines.append("")
+            for cls in matches:
+                lines.extend(_format_class_markdown(cls, level=3))
+
+        live = item.get("live_introspection")
+        if live:
+            lines.append("### Live introspection")
+            lines.append("")
+            if live.get("enabled"):
+                lines.append(f"- object: `{live.get('module')}.{live.get('qualname')}`")
+                if live.get("signature"):
+                    lines.append(f"- signature: `{live.get('signature')}`")
+                if live.get("mro"):
+                    lines.append(f"- mro: `{', '.join(live.get('mro', [])[:10])}`")
+                lines.append("")
+                members = live.get("members", []) or []
+                if members:
+                    lines.append("| Name | Kind | Signature |")
+                    lines.append("| --- | --- | --- |")
+                    for mem in members[:120]:
+                        sig = str(mem.get("signature", "")).replace("|", "\\|")
+                        lines.append(f"| `{mem.get('name')}` | `{mem.get('kind')}` | `{sig}` |")
+                    lines.append("")
+            else:
+                lines.append(f"- disabled/error: {live.get('error')}")
+                lines.append("")
+
+    if result.get("queries"):
+        lines.append("## Generated APIDoc query lines")
+        lines.append("")
+        lines.append("```text")
+        lines.extend(result.get("queries", []))
+        lines.append("```")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_optional_output(text: str, params: Dict[str, Any], default_name: str) -> Dict[str, Any]:
+    out_path = params.get("out_path")
+    if not out_path:
+        return {}
+
+    p = Path(str(out_path)).expanduser()
+    if p.exists() and p.is_dir():
+        p = p / default_name
+    elif str(out_path).endswith(os.sep):
+        p.mkdir(parents=True, exist_ok=True)
+        p = p / default_name
+    else:
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+    p.write_text(text, encoding="utf-8")
+    return {"out_path": str(p)}
+
+
+@dataclass
+class APIDocSourceClassIndexBlock(BaseBlock):
+    """Index Python source files and return all classes/functions/imports without fetching external docs."""
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        index = _index_modules(payload, params)
+        return index, {"type": "apidoc-source-class-index", **index.get("counts", {})}
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "payload": "Inline Python code, file path, folder path, dict with code/path/files, or list of paths.",
+            "max_files": 250,
+            "max_bytes_per_file": 1000000,
+            "include_patterns": "*.py or comma-separated patterns",
+        }
+
+
+@dataclass
+class APIDocClassNameInfoBlock(BaseBlock):
+    """Return specific structured information about requested classnames."""
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        requested = _requested_names_from_payload(payload, params)
+        source_payload = _source_payload_from_payload(payload, params)
+
+        index_payload = source_payload
+        if source_payload is payload and requested and not any(isinstance(payload, t) for t in (dict, list, tuple, set)):
+            index_payload = params.get("source") or params.get("path") or params.get("project_path") or ""
+
+        sources = _read_sources(index_payload, params)
+        raw_modules = [_parse_python_source(src["path"], src["code"]) for src in sources]
+        index = {
+            "type": "apidoc-source-class-index",
+            "version": "2026.06.08-classname-detail-v2",
+            "_raw_modules": raw_modules,
+            "sources": [{"path": src["path"], "bytes": len(src["code"])} for src in sources],
+            "counts": {
+                "sources": len(sources),
+                "modules": len(raw_modules),
+                "classes": len(_all_classes(raw_modules)),
+                "functions": sum(len(m.functions) for m in raw_modules),
+                "imports": sum(len(m.imports) for m in raw_modules),
+                "parse_errors": sum(len(m.errors) for m in raw_modules),
+            },
+        }
+
+        results = _match_classes(index, requested, params)
+        queries = _all_queries_from_matches(results)
+
+        if requested:
+            queries = _dedupe(list(queries) + requested)
+
+        max_queries = int(params.get("max_queries", 100000) or 100000)
+        if max_queries > 0:
+            queries = queries[:max_queries]
+
+        response = {
+            "type": "apidoc-classname-info",
+            "version": "2026.06.08-classname-detail-v2",
+            "requested": requested,
+            "results": results,
+            "queries": queries,
+            "sources": index["sources"],
+            "index_counts": index["counts"],
+            "allow_import": bool(params.get("allow_import", False)),
+            "notes": [
+                "Static AST analysis is used by default and does not import scanned source files.",
+                "Live import/introspection only runs when allow_import=True and classnames are dotted module paths.",
+            ],
+        }
+
+        meta = {
+            "type": "apidoc-classname-info",
+            "requested": len(requested),
+            "found": sum(1 for item in results if item.get("found")),
+            "queries": len(queries),
+            **index["counts"],
+        }
+        return response, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "classnames/class_names/classes": "Class names to locate. Supports simple names or dotted names.",
+            "source/path/project_path/files/paths/code": "Where to scan for source classes.",
+            "match_threshold": 0.70,
+            "max_matches_per_class": 10,
+            "allow_import": False,
+            "max_files": 250,
+            "max_bytes_per_file": 1000000,
+            "max_queries": 100000,
+        }
+
+
+@dataclass
+class APIDocClassNameReportBlock(BaseBlock):
+    """Return a Markdown report for requested classnames with fields/methods/properties/signatures/query lines."""
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        if isinstance(payload, dict) and payload.get("type") == "apidoc-classname-info":
+            result = payload
+        else:
+            result, _ = APIDocClassNameInfoBlock().execute(payload, params=params)
+
+        report = _format_report(result)
+        meta = {
+            "type": "apidoc-classname-report",
+            "requested": len(result.get("requested", []) or []),
+            "found": sum(1 for item in result.get("results", []) or [] if item.get("found")),
+            "queries": len(result.get("queries", []) or []),
+        }
+        meta.update(_write_optional_output(report, params, "apidoc_classname_report.md"))
+        return report, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        info = APIDocClassNameInfoBlock().get_params_info()
+        info["out_path"] = "Optional .md file path or output directory."
+        return info
+
+
+@dataclass
+class APIDocClassNameQueriesBlock(BaseBlock):
+    """Return plain one-line APIDoc queries generated from requested class names and matched class members."""
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        if isinstance(payload, dict) and payload.get("type") == "apidoc-classname-info":
+            result = payload
+        else:
+            result, _ = APIDocClassNameInfoBlock().execute(payload, params=params)
+
+        queries = _dedupe(result.get("queries", []) or [])
+        text = "\n".join(queries).rstrip() + ("\n" if queries else "")
+        meta = {
+            "type": "apidoc-classname-queries",
+            "query_count": len(queries),
+            "requested": len(result.get("requested", []) or []),
+            "found": sum(1 for item in result.get("results", []) or [] if item.get("found")),
+        }
+        meta.update(_write_optional_output(text, params, "apidoc_classname_queries.txt"))
+        return text, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        info = APIDocClassNameInfoBlock().get_params_info()
+        info["out_path"] = "Optional .txt file path or output directory."
+        return info
+
+
+@dataclass
+class APIDocClassNameFetchBlock(BaseBlock):
+    """Generate queries from class names/source symbols and pass them into an existing APIDocBlock if present."""
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        info, meta = APIDocClassNameInfoBlock().execute(payload, params=params)
+        query_text = "\n".join(info.get("queries", []) or "")
+
+        apidoc_cls = globals().get("APIDocBlock")
+        if apidoc_cls is None:
+            return query_text, {
+                "type": "apidoc-classname-fetch",
+                "ran_fetch": False,
+                "reason": "APIDocBlock is not present in this standalone file. Returning generated query text.",
+                **meta,
+            }
+
+        merged = dict(params)
+        merged.setdefault("direct_mode", True)
+        merged.setdefault("search_fallback", False)
+        merged.setdefault("crawl_direct_pages", False)
+        merged.setdefault("output_style", "advanced_report")
+
+        try:
+            output, fetch_meta = apidoc_cls().execute(query_text, params=merged)
+            fetch_meta["classname_info"] = meta
+            return output, {"type": "apidoc-classname-fetch", "ran_fetch": True, **fetch_meta}
+        except Exception as exc:
+            return query_text, {
+                "type": "apidoc-classname-fetch",
+                "ran_fetch": False,
+                "reason": f"APIDocBlock fetch failed: {exc!r}",
+                "traceback": traceback.format_exc(),
+                **meta,
+            }
+
+    def get_params_info(self) -> Dict[str, Any]:
+        info = APIDocClassNameInfoBlock().get_params_info()
+        info.update(
+            {
+                "direct_mode": True,
+                "search_fallback": False,
+                "crawl_direct_pages": False,
+                "output_style": "advanced_report",
+            }
+        )
+        return info
+
+
+def _register_block(name: str, cls: Any) -> None:
+    if BLOCKS is None:
+        return
+    try:
+        BLOCKS.register(name, cls)
+    except Exception:
+        pass
+
+_register_block("apidoc_source_class_index", APIDocSourceClassIndexBlock)
+_register_block("apidoc_class_index", APIDocSourceClassIndexBlock)
+
+_register_block("apidoc_classname_info", APIDocClassNameInfoBlock)
+_register_block("apidoc_class_info", APIDocClassNameInfoBlock)
+_register_block("apidoc_classnames", APIDocClassNameInfoBlock)
+_register_block("apidoc_class_lookup", APIDocClassNameInfoBlock)
+
+_register_block("apidoc_classname_report", APIDocClassNameReportBlock)
+# kept existing apidoc_class_report owner; use apidoc_classname_report instead
+_register_block("apidoc_class_detail_report", APIDocClassNameReportBlock)
+
+_register_block("apidoc_classname_queries", APIDocClassNameQueriesBlock)
+# kept existing apidoc_class_queries owner; use apidoc_classname_queries instead
+_register_block("apidoc_class_detail_queries", APIDocClassNameQueriesBlock)
+
+_register_block("apidoc_classname_fetch", APIDocClassNameFetchBlock)
+# kept existing apidoc_class_fetch owner; use apidoc_classname_fetch instead
