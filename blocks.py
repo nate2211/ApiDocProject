@@ -2807,14 +2807,15 @@ COMMON_PARAMS = {
     "direct_mode": True,
     "search_fallback": False,
     "search_mode": "direct_first | search_first | search_only",
-    "allow_search_in_safe_mode": False,
     "direct_fallback_when_search_fails": False,
     "crawl_direct_pages": False,
     "use_cache": True,
-    "max_direct_urls_per_query": 8,
-    "max_pages_per_query": 2,
-    "max_links_per_page": 20,
-    "max_chars_per_page": 8000,
+    "max_direct_urls_per_query": 32,
+    "max_pages_per_query": 8,
+    "max_links_per_page": 160,
+    "max_search_hits": 20,
+    "max_chars_per_page": 24000,
+    "max_queries": 100000,
     "timeout": 20,
     "delay": 0.10,
     "output_style": "advanced_report",
@@ -4686,6 +4687,30 @@ class _APIDocSafeExtractor(_APIDocSafeHTMLParser):
         return {"title": title, "headings": self.headings[:50], "text": text, "links": self.links[:self.max_links]}
 
 
+
+
+def _apidoc_query_limit(params: Optional[Dict[str, Any]], default: int = 100000, hard_max: int = 1000000) -> int:
+    """Return the APIDoc query limit.
+
+    0 means unlimited.  This deliberately ignores the old safe_max_queries path;
+    query caps are controlled only by max_queries now.
+    """
+    p = params or {}
+    raw = p.get("max_queries", default)
+    if raw is None:
+        return 0
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in {"", "0", "none", "null", "false", "off", "no", "unlimited", "inf", "infinite", "all"}:
+            return 0
+    try:
+        value = int(raw)
+    except Exception:
+        value = int(default)
+    if value <= 0:
+        return 0
+    return min(value, int(hard_max))
+
 _ORIGINAL_APIDOC_ENGINE_INIT_CRASHSAFE = APIDocEngine.__init__
 _ORIGINAL_APIDOC_ENGINE_READ_QUERIES_CRASHSAFE = APIDocEngine.read_queries
 _ORIGINAL_APIDOC_ENGINE_HTTP_GET_CRASHSAFE = APIDocEngine.http_get
@@ -4696,39 +4721,45 @@ _ORIGINAL_APIDOC_ENGINE_EXTRACT_PAGE_CRASHSAFE = APIDocEngine.extract_page
 
 def _apidoc_crashsafe_init(self: APIDocEngine, params: Optional[Dict[str, Any]] = None, progress: Optional[Callable[[str], None]] = None):
     params = dict(params or {})
-    params.setdefault("safe_mode", True)
-    # The dangerous defaults were crawling + many DOM parses.  Keep signatures but
-    # use conservative defaults unless the caller explicitly opts out with safe_mode=false.
+
+    # Full APIDoc mode: safe_mode no longer caps queries/pages/search.
+    # Keep the public parameter name for compatibility, but force it off inside
+    # this engine so old safe_* limits can never silently shrink the job list.
+    params["safe_mode"] = False
+    params.pop("safe_max_queries", None)
+    params.pop("safe_max_pages_per_query", None)
+    params.pop("safe_max_direct_urls_per_query", None)
+    params.pop("safe_max_links_per_page", None)
+    params.pop("safe_max_search_hits", None)
+    params.pop("safe_max_chars_per_page", None)
+
     requested_direct_mode = _apidoc_safe_bool(params.get("direct_mode"), True)
     if not requested_direct_mode:
         params.setdefault("search_mode", "search_first")
         params["search_fallback"] = True
-        params.setdefault("allow_search_in_safe_mode", True)
-    if _apidoc_safe_bool(params.get("safe_mode"), True):
-        params.setdefault("crawl_direct_pages", False)
-        params.setdefault("search_fallback", False if requested_direct_mode else True)
-        params.setdefault("max_pages_per_query", 2)
-        params.setdefault("max_direct_urls_per_query", 8)
-        params.setdefault("max_links_per_page", 20)
-        params.setdefault("max_chars_per_page", 8000)
-        params.setdefault("max_response_bytes", 1_250_000)
-        params.setdefault("max_queries", 80)
-        params.setdefault("timeout", 12)
-        params.setdefault("delay", 0.03)
-        params.setdefault("use_safe_html_parser", True)
+    else:
+        params.setdefault("search_mode", "direct_first")
+        params.setdefault("search_fallback", False)
+
+    # High, explicit defaults.  These are normal max_* settings, not safe-mode caps.
+    params.setdefault("crawl_direct_pages", False)
+    params.setdefault("max_pages_per_query", 8)
+    params.setdefault("max_direct_urls_per_query", 32)
+    params.setdefault("max_links_per_page", 160)
+    params.setdefault("max_search_hits", 20)
+    params.setdefault("max_chars_per_page", 24000)
+    params.setdefault("max_response_bytes", 5_000_000)
+    params.setdefault("max_queries", 100000)
+    params.setdefault("timeout", 20)
+    params.setdefault("delay", 0.03)
+    params.setdefault("use_safe_html_parser", False)
+
     _ORIGINAL_APIDOC_ENGINE_INIT_CRASHSAFE(self, params=params, progress=progress)
-    self.safe_mode = _apidoc_safe_bool(self.params.get("safe_mode"), True)
-    if self.safe_mode:
-        self.crawl_direct_pages = False if not _apidoc_safe_bool(self.params.get("allow_crawl_in_safe_mode"), False) else _apidoc_safe_bool(self.params.get("crawl_direct_pages"), False)
-        if not self.direct_mode:
-            self.search_fallback = True
-        else:
-            self.search_fallback = False if not _apidoc_safe_bool(self.params.get("allow_search_in_safe_mode"), False) else _apidoc_safe_bool(self.params.get("search_fallback"), False)
-        self.max_pages = min(self.max_pages, _apidoc_safe_int(self.params.get("safe_max_pages_per_query"), 2, 1, 12))
-        self.max_direct = min(self.max_direct, _apidoc_safe_int(self.params.get("safe_max_direct_urls_per_query"), 8, 1, 32))
-        self.max_links = min(self.max_links, _apidoc_safe_int(self.params.get("safe_max_links_per_page"), 20, 0, 120))
-        self.max_hits = min(self.max_hits, _apidoc_safe_int(self.params.get("safe_max_search_hits"), 4, 1, 20))
-        self.max_chars = min(self.max_chars, _apidoc_safe_int(self.params.get("safe_max_chars_per_page"), 8000, 500, 60000))
+
+    # Important: force runtime state off too.  Several methods branch on self.safe_mode.
+    self.safe_mode = False
+    self.params["safe_mode"] = False
+
     try:
         import atexit
         atexit.register(lambda: getattr(self, "session", None) and self.session.close())
@@ -4738,14 +4769,15 @@ def _apidoc_crashsafe_init(self: APIDocEngine, params: Optional[Dict[str, Any]] 
 
 def _apidoc_crashsafe_read_queries(self: APIDocEngine, payload: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     jobs, meta = _ORIGINAL_APIDOC_ENGINE_READ_QUERIES_CRASHSAFE(self, payload)
-    max_queries = _apidoc_safe_int(self.params.get("max_queries"), 80, 1, 100000)
-    if self.safe_mode:
-        max_queries = min(max_queries, _apidoc_safe_int(self.params.get("safe_max_queries"), 80, 1, 500))
-    if len(jobs) > max_queries:
+
+    # No safe-mode query cap.  Only max_queries applies; max_queries=0/None/"unlimited"
+    # means no truncation.
+    max_queries = _apidoc_query_limit(getattr(self, "params", {}) or {}, default=100000, hard_max=1000000)
+    if max_queries and len(jobs) > max_queries:
         meta = dict(meta or {})
         meta["original_count"] = len(jobs)
         meta["truncated_to"] = max_queries
-        meta["safe_mode_note"] = "Query list was capped to avoid 0xC0000409 hard process crashes. Raise max_queries or set safe_mode=false if needed."
+        meta["query_limit_note"] = "Query list was capped only by max_queries. Set max_queries=0 or 'unlimited' for no cap."
         jobs = jobs[:max_queries]
     return jobs, meta
 
@@ -4933,20 +4965,35 @@ _ORIGINAL_APIDOC_DEFAULT_OUTPUT_PARAMS = _apidoc_default_output_params
 
 def _apidoc_crashsafe_output_params(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     merged = _ORIGINAL_APIDOC_DEFAULT_OUTPUT_PARAMS(params)
-    merged.setdefault("safe_mode", True)
-    merged.setdefault("crawl_direct_pages", False)
+
+    # Full APIDoc mode by default.  safe_mode and all safe_* caps are intentionally
+    # removed from the effective runtime parameters.
+    merged["safe_mode"] = False
+    for key in (
+        "safe_max_queries",
+        "safe_max_pages_per_query",
+        "safe_max_direct_urls_per_query",
+        "safe_max_links_per_page",
+        "safe_max_search_hits",
+        "safe_max_chars_per_page",
+    ):
+        merged.pop(key, None)
+
     if not _apidoc_safe_bool(merged.get("direct_mode"), True):
         merged.setdefault("search_mode", "search_first")
         merged["search_fallback"] = True
-        merged.setdefault("allow_search_in_safe_mode", True)
     else:
+        merged.setdefault("search_mode", "direct_first")
         merged.setdefault("search_fallback", False)
-    merged.setdefault("max_pages_per_query", 2)
-    merged.setdefault("max_direct_urls_per_query", 8)
-    merged.setdefault("max_links_per_page", 20)
-    merged.setdefault("max_chars_per_page", 8000)
-    merged.setdefault("max_response_bytes", 1_250_000)
-    merged.setdefault("max_queries", 80)
+
+    merged.setdefault("crawl_direct_pages", False)
+    merged.setdefault("max_pages_per_query", 8)
+    merged.setdefault("max_direct_urls_per_query", 32)
+    merged.setdefault("max_links_per_page", 160)
+    merged.setdefault("max_search_hits", 20)
+    merged.setdefault("max_chars_per_page", 24000)
+    merged.setdefault("max_response_bytes", 5_000_000)
+    merged.setdefault("max_queries", 100000)
     return merged
 
 
@@ -5850,7 +5897,7 @@ class APIDocSourceNeedAnalyzer:
         self.max_files = as_int(self.params.get("max_files"), 80, 1, 1000)
         self.max_bytes_per_file = as_int(self.params.get("max_bytes_per_file"), 320_000, 4096, 10_000_000)
         self.max_symbols = as_int(self.params.get("max_symbols"), 220, 10, 5000)
-        self.max_queries = as_int(self.params.get("max_queries"), 300, 1, 5000)
+        self.max_queries = _apidoc_query_limit(self.params, default=100000, hard_max=1000000)
         self.prefer_direct_urls = as_bool(self.params.get("prefer_direct_urls"), True)
         self.include_stdlib = as_bool(self.params.get("include_stdlib"), True)
         self.include_generic_symbols = as_bool(self.params.get("include_generic_symbols"), True)
@@ -6141,7 +6188,8 @@ class APIDocSourceNeedAnalyzer:
                 if source_file and source_file not in old["source_files"]:
                     old["source_files"].append(source_file)
                 old["confidence"] = max(float(old.get("confidence") or 0.0), float(item.get("confidence") or 0.0))
-        return sorted(merged.values(), key=lambda x: (-float(x.get("confidence") or 0.0), str(x.get("value") or "")))[: self.max_queries]
+        ordered = sorted(merged.values(), key=lambda x: (-float(x.get("confidence") or 0.0), str(x.get("value") or "")))
+        return ordered if not self.max_queries else ordered[: self.max_queries]
 
     def needs_to_queries(self, needs: List[Dict[str, Any]]) -> List[str]:
         out: List[str] = []
@@ -6149,7 +6197,8 @@ class APIDocSourceNeedAnalyzer:
             value = str(item.get("value") or "").strip()
             if value:
                 out.append(value)
-        return _source_apidoc_dedupe(out)[: self.max_queries]
+        deduped = _source_apidoc_dedupe(out)
+        return deduped if not self.max_queries else deduped[: self.max_queries]
 
     def markdown(self, analysis: Dict[str, Any]) -> str:
         lines: List[str] = []
@@ -6220,7 +6269,7 @@ class APIDocSourceScanBlock(BaseBlock):
             "max_files": 80,
             "max_bytes_per_file": 320000,
             "max_symbols": 220,
-            "max_queries": 300,
+            "max_queries": "100000, or 0/unlimited for no cap",
             "prefer_direct_urls": True,
             "include_stdlib": True,
             "include_generic_symbols": True,
@@ -6289,12 +6338,13 @@ class APIDocSourceFetchBlock(BaseBlock):
         analysis = analyzer.analyze(payload)
         query_text = "\n".join(analysis.get("queries", []) or [])
         merged = dict(params)
+        merged["safe_mode"] = False
+        merged.pop("safe_max_queries", None)
         direct_mode = as_bool(merged.get("direct_mode"), True)
         merged.setdefault("direct_mode", direct_mode)
         if not direct_mode:
             merged.setdefault("search_mode", "search_first")
             merged["search_fallback"] = True
-            merged.setdefault("allow_search_in_safe_mode", True)
         else:
             merged.setdefault("search_fallback", False)
         merged.setdefault("crawl_direct_pages", False)
